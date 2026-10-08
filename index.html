@@ -501,13 +501,13 @@ let lastReloadToken = null;
 
 /* Supabaseから、この端末のチームに必要な情報だけを組み立てる */
 async function fetchTeamState(){
-  const { data: st, error: e1 } = await db.from('state').select('*').eq('id',1).single();
+  const { data: st, error: e1 } = await db.from('state').select('phase,current_q,deadline,show_team_results,reload_token').eq('id',1).single();
   if(e1) throw e1;
   const qNo = Number(st.current_q) || 0;
 
   const [{ data: team, error: e2 }, { data: qRow }, { data: mine }] = await Promise.all([
-    db.from('teams').select('*').eq('team_id', Number(teamId)).single(),
-    qNo>0 ? db.from('questions').select('*').eq('q_no', qNo).single() : Promise.resolve({data:null}),
+    db.from('teams').select('team_id,team_name,points,debt').eq('team_id', Number(teamId)).single(),
+    qNo>0 ? db.from('questions').select('q_no,text,choice_a,choice_b,choice_c,choice_d').eq('q_no', qNo).single() : Promise.resolve({data:null}),
     db.rpc('my_bet', { p_team_id: Number(teamId) })
   ]);
   if(e2) throw e2;
@@ -545,7 +545,7 @@ function scheduleRefresh(){
 let polling = false;   // 処理が重ならないようにする
 
 async function poll(){
-  if(!teamId){ setTimeout(poll, POLL_MIN_MS); return; }
+  if(!teamId) return;
   if(polling) return;
   const mySeq = ++pollSeq;
   let nextDelay = POLL_MIN_MS;
@@ -646,7 +646,9 @@ async function poll(){
     nextDelay = Math.min(POLL_MAX_MS, POLL_MIN_MS * Math.pow(2, Math.min(pollFailCount, 4)));
   }finally{
     polling = false;
-    setTimeout(poll, nextDelay);
+    // ★ここで次回を予約しない（GAS時代の名残の自動ポーリングを廃止）。
+    //   更新はリアルタイム通知で届くので、0.5秒ごとに問い合わせる必要はない。
+    //   取りこぼし対策は、下の30秒ごとの保険でまかなう。
   }
 }
 
@@ -669,7 +671,8 @@ function tickCountdown(){
 
 function startPolling(){
   poll();
-  countdownTimer = setInterval(tickCountdown, 200);
+  countdownTimer = setInterval(tickCountdown, 200);   // 残り時間の表示（通信なし・端末内だけ）
+  setInterval(poll, 30000);                           // 保険：通知を取りこぼしても追いつく
 
   /* Supabaseのリアルタイム購読：出題・締切・正解発表が即座に反映される
      ■レスポンス低下への対策を2つ入れています
