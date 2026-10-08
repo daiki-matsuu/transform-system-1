@@ -534,10 +534,22 @@ async function fetchTeamState(){
   };
 }
 
+/* 通知のまとめ処理：連続して届いた通知を1回にまとめる */
+const BURST_WAIT_MS = 120;
+let burstTimer = null;
+function scheduleRefresh(){
+  if(burstTimer) return;
+  burstTimer = setTimeout(() => { burstTimer = null; poll(); }, BURST_WAIT_MS);
+}
+
+let polling = false;   // 処理が重ならないようにする
+
 async function poll(){
   if(!teamId){ setTimeout(poll, POLL_MIN_MS); return; }
+  if(polling) return;
   const mySeq = ++pollSeq;
   let nextDelay = POLL_MIN_MS;
+  polling = true;
   try{
     const data = await fetchTeamState();
     pollFailCount = 0;
@@ -633,6 +645,7 @@ async function poll(){
     console.error('[poll] 通信に失敗しました（' + pollFailCount + '回連続）:', err);
     nextDelay = Math.min(POLL_MAX_MS, POLL_MIN_MS * Math.pow(2, Math.min(pollFailCount, 4)));
   }finally{
+    polling = false;
     setTimeout(poll, nextDelay);
   }
 }
@@ -658,11 +671,17 @@ function startPolling(){
   poll();
   countdownTimer = setInterval(tickCountdown, 200);
 
-  // Supabaseのリアルタイム購読：出題・締切・正解発表が即座に反映される
+  /* Supabaseのリアルタイム購読：出題・締切・正解発表が即座に反映される
+     ■レスポンス低下への対策を2つ入れています
+      1) teams は「自分のチームの行だけ」を購読する。
+         精算時は24チーム分が書き換わるので、そのまま購読すると自分に関係のない
+         23件ぶんまで通知が届き、そのたびに読み直しが走っていました。
+      2) 通知が連続して届いたときは、120ms待ってまとめて1回だけ処理する。 */
   db.channel('quiz-form-' + teamId)
-    .on('postgres_changes', { event:'*', schema:'public', table:'state'     }, () => poll())
-    .on('postgres_changes', { event:'*', schema:'public', table:'questions' }, () => poll())
-    .on('postgres_changes', { event:'*', schema:'public', table:'teams'     }, () => poll())
+    .on('postgres_changes', { event:'*', schema:'public', table:'state'     }, scheduleRefresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'questions' }, scheduleRefresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'teams',
+                              filter:'team_id=eq.' + teamId                 }, scheduleRefresh)
     .subscribe();
 }
 
