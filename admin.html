@@ -37,6 +37,35 @@
   button.ok{background:var(--ok); color:#04241a;}
   button.toggle-on{background:var(--ok); color:#04241a;}
   button:disabled{opacity:.4; cursor:not-allowed;}
+
+  /* ===== 押したことが必ず分かるようにする（二重送信の防止） ===== */
+  button{ transition:transform .06s ease, box-shadow .12s ease, filter .12s ease; }
+  /* 指・マウスで押している最中：へこませる */
+  button:not(:disabled):active{
+    transform:scale(.94) translateY(1px);
+    filter:brightness(.82);
+    box-shadow:inset 0 2px 6px rgba(0,0,0,.45);
+  }
+  button:not(:disabled):hover{ filter:brightness(1.08); }
+  /* キーボード操作でも分かるように */
+  button:focus-visible{ outline:3px solid #7fd4ff; outline-offset:2px; }
+
+  /* 押された直後に一瞬光らせる（クリックが通ったことの合図） */
+  @keyframes btnFlash{
+    0%  { box-shadow:0 0 0 0 rgba(255,255,255,.85); }
+    100%{ box-shadow:0 0 0 14px rgba(255,255,255,0); }
+  }
+  button.pressed{ animation:btnFlash .45s ease-out; }
+
+  /* 送信中：スピナーを出して押せなくする */
+  button.busy{ position:relative; color:transparent !important; pointer-events:none; }
+  button.busy::after{
+    content:''; position:absolute; inset:0; margin:auto; width:16px; height:16px;
+    border:2.5px solid rgba(0,0,0,.25); border-top-color:rgba(0,0,0,.85);
+    border-radius:50%; animation:btnSpin .6s linear infinite;
+  }
+  button.secondary.busy::after{ border-color:rgba(255,255,255,.3); border-top-color:#fff; }
+  @keyframes btnSpin{ to{ transform:rotate(360deg); } }
   .status-line{display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px; font-size:13px;}
   .status-line b{color:var(--gold-bright);}
   .pill{padding:3px 10px; border-radius:20px; font-size:11px; font-weight:900; border:1px solid var(--gold); color:var(--gold-bright);}
@@ -160,6 +189,9 @@
         <button data-c="B" onclick="setCorrect('B')">正解 B</button>
         <button data-c="C" onclick="setCorrect('C')">正解 C</button>
         <button data-c="D" onclick="setCorrect('D')">正解 D</button>
+      </div>
+      <div class="hint" id="settledNote" style="display:none; font-size:11px; color:#ffd27d; margin:4px 0 0;">
+        ✓ この問題は精算済みです。やり直す場合は、もう一度この問題で「ベット開始」してください。
       </div>
       <div class="msg" id="msg1"></div>
     </div>
@@ -358,11 +390,13 @@ function init(){
   loadEditFields(); // 起動時に、選択中の問題番号（デフォルト第1問）の内容を編集欄へ読み込んでおく
   poll();
 
-  // Supabaseのリアルタイム購読：他の端末やTable Editorからの変更にも即追従する
+  /* Supabaseのリアルタイム購読：他の端末やTable Editorからの変更にも即追従する。
+     精算時は50行近くが一度に書き換わるため、通知が連続して届く。
+     1件ずつ読み直すと往復が積み上がって重くなるので、120ms待ってまとめて処理する。 */
   db.channel('quiz-admin')
-    .on('postgres_changes', { event:'*', schema:'public', table:'state'     }, () => poll())
-    .on('postgres_changes', { event:'*', schema:'public', table:'teams'     }, () => poll())
-    .on('postgres_changes', { event:'*', schema:'public', table:'questions' }, () => poll())
+    .on('postgres_changes', { event:'*', schema:'public', table:'state'     }, scheduleRefresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'teams'     }, scheduleRefresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'questions' }, scheduleRefresh)
     .subscribe();
 }
 
@@ -400,6 +434,35 @@ function buildQuestion(q){
   };
 }
 
+/* ===== 全ボタン共通の「押した」フィードバック =====
+ * 38個のボタンそれぞれに手を入れるのではなく、クリックを1か所で受けて
+ * 共通の見た目を付けます。付け忘れが起きず、今後ボタンを足しても自動で効きます。
+ *   1) 押した瞬間：へこむ＋白く光る（CSS側。通信を待たないので必ず見える）
+ *   2) 送信中　　：ボタン内がスピナーになり、押せなくなる（二重送信の防止）
+ *   3) 完了　　　：元に戻る
+ */
+let pressedBtn = null;
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if(!btn || btn.disabled) return;
+  pressedBtn = btn;
+  btn.classList.remove('pressed');
+  void btn.offsetWidth;           // アニメーションを連打でも毎回やり直させる
+  btn.classList.add('pressed');
+  setTimeout(() => btn.classList.remove('pressed'), 500);
+}, true);                          // capture段階で拾うので、どのボタンでも確実に動く
+
+function beginBusy(){
+  const b = pressedBtn;
+  pressedBtn = null;
+  if(b) b.classList.add('busy');
+  return b;
+}
+function endBusy(b){
+  if(b) b.classList.remove('busy');
+}
+
 async function apiGet(action, extra){
   try{
     if(action === 'screen_state'){
@@ -408,7 +471,7 @@ async function apiGet(action, extra){
       const qNo = Number(st.current_q) || 0;
 
       const [{ data:qRow }, { data:rk }, { data:hist }] = await Promise.all([
-        qNo>0 ? db.from('questions').select('*').eq('q_no',qNo).single() : Promise.resolve({data:null}),
+        qNo>0 ? db.from('questions').select(QCOLS).eq('q_no',qNo).single() : Promise.resolve({data:null}),
         db.rpc('ranking'),
         qNo>0 ? db.from('history').select('team_id,delta').eq('q_no',qNo) : Promise.resolve({data:[]})
       ]);
@@ -444,7 +507,7 @@ async function apiGet(action, extra){
 
     if(action === 'question_detail'){
       const qNo = Number((extra||'').replace(/[^0-9]/g,'')) || 1;
-      const { data:q, error } = await db.from('questions').select('*').eq('q_no',qNo).single();
+      const { data:q, error } = await db.from('questions').select(QCOLS).eq('q_no',qNo).single();
       if(error) throw error;
       return { ok:true, question:{
         q_no:q.q_no, text:q.text, choiceA:q.choice_a, choiceB:q.choice_b,
@@ -467,6 +530,7 @@ async function apiGet(action, extra){
 /* 旧GASのaction名 → SupabaseのRPC呼び出しに振り分ける */
 async function apiPost(body){
   const a = body.action;
+  const busyBtn = beginBusy();      // 押されたボタンをスピナー表示にする
   try{
     let res;
     switch(a){
@@ -520,6 +584,8 @@ async function apiPost(body){
     return Object.assign({ ok:true }, (res.data && typeof res.data === 'object') ? res.data : {});
   }catch(err){
     return { ok:false, error: err.message || String(err) };
+  }finally{
+    endBusy(busyBtn);               // 完了したら元に戻す
   }
 }
 
@@ -532,7 +598,22 @@ let pollFailCount = 0;
 let pollTimer = null;
 let autoPoll = true;
 
+/* 通知のまとめ処理：連続して届いた通知を1回にまとめる */
+const QCOLS = 'q_no,text,layout,choice_a,choice_b,choice_c,choice_d,'
+            + 'media_a,media_b,media_c,media_d,main_media,intro_video,answer_video,'
+            + 'explanation_text,explanation_media,odds_multiplier,revealed_correct';
+const BURST_WAIT_MS = 120;
+let burstTimer = null;
+function scheduleRefresh(){
+  if(burstTimer) return;
+  burstTimer = setTimeout(() => { burstTimer = null; poll(); }, BURST_WAIT_MS);
+}
+
+let polling = false;   // 処理が重ならないようにする
+
 async function poll(){
+  if(polling) return;
+  polling = true;
   clearTimeout(pollTimer);
   const startedAt = Date.now();
   let nextDelay = POLL_MIN_MS;
@@ -562,6 +643,16 @@ async function poll(){
       b.classList.toggle('active', Number(b.dataset.m) === currentMultiplier);
     });
 
+    // 正解ボタンの有効・無効を、サーバー上の状態から決める。
+    // 精算済みの問題では押せない（＝二重精算の操作ミスが起きない）。
+    // 次の問題を出題すれば自動的に押せる状態へ戻る。
+    if(!settling){
+      const alreadySettled = !!(data.question && data.question.revealed);
+      setCorrectBtnsDisabled(alreadySettled);
+      const note = document.getElementById('settledNote');
+      if(note) note.style.display = alreadySettled ? 'block' : 'none';
+    }
+
     currentFlags = { show_ranking: data.show_ranking, show_explanation: data.show_explanation, show_final_results: data.show_final_results, show_title: data.show_title, show_team_results: data.show_team_results };
     document.getElementById('btnRanking').className = currentFlags.show_ranking ? 'toggle-on' : '';
     document.getElementById('btnExplanation').className = currentFlags.show_explanation ? 'toggle-on' : '';
@@ -584,6 +675,7 @@ async function poll(){
     console.error('[poll] 管理パネルの状態取得でエラー:', err);
     nextDelay = Math.min(POLL_MAX_MS, POLL_MIN_MS * Math.pow(2, Math.min(pollFailCount, 4)));
   }finally{
+    polling = false;
     if(autoPoll) pollTimer = setTimeout(poll, nextDelay);
   }
 }
@@ -728,15 +820,37 @@ async function closeBetting(){
   poll();
 }
 
+/* 正解確定は「1問につき1回だけ」。連打や押し直しによる二重精算を防ぐため、
+   押した瞬間に4つのボタンを無効化する（サーバー側でも二重実行は拒否される）。 */
+let settling = false;
+function setCorrectBtnsDisabled(disabled){
+  document.querySelectorAll('.correct-btns button').forEach(b => { b.disabled = disabled; });
+}
+
 async function setCorrect(c){
+  if(settling) return;                       // 応答待ちの間は何度押しても無視する
   const grantLoan = document.getElementById('grantLoanCheck').checked;
   const confirmMsg = grantLoan
     ? `正解を「${c}」として確定し、ポイントを精算します。よろしいですか？（取り消せません）`
     : `正解を「${c}」として確定し、ポイントを精算します。\n※借入ポイントは付与しません（この問題で大会を終了する設定）。\nよろしいですか？（取り消せません）`;
   if(!confirm(confirmMsg)) return;
-  const data = await apiPost({action:'admin_set_correct', correct:c, grant_loan:grantLoan});
-  showMsg('msg1', data);
-  poll();
+
+  settling = true;
+  setCorrectBtnsDisabled(true);
+  showMsg('msg1', { ok:true, message:'精算中です。そのままお待ちください...' });
+  try{
+    const data = await apiPost({action:'admin_set_correct', correct:c, grant_loan:grantLoan});
+    showMsg('msg1', data);
+    // 成功時はボタンを無効のままにする（この問題はもう精算済みのため）。
+    // 失敗したときだけ押し直せるように戻す。
+    if(!data.ok) setCorrectBtnsDisabled(false);
+  }catch(err){
+    showMsg('msg1', { ok:false, error: err.message || String(err) });
+    setCorrectBtnsDisabled(false);
+  }finally{
+    settling = false;
+    poll();
+  }
 }
 
 async function forceReload(){
