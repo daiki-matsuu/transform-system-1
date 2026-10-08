@@ -620,7 +620,7 @@ async function refresh(){
 
     const qNo = Number(st.current_q) || 0;
     const [{ data: qRow }, { data: rk, error: e2 }, { data: hist }] = await Promise.all([
-      qNo > 0 ? db.from('questions').select('*').eq('q_no', qNo).single()
+      qNo > 0 ? db.from('questions').select(QCOLS).eq('q_no', qNo).single()
               : Promise.resolve({ data:null }),
       db.rpc('ranking'),
       qNo > 0 ? db.from('history').select('team_id,delta').eq('q_no', qNo)
@@ -680,11 +680,26 @@ async function refresh(){
   }
 }
 
-/* 変更があった瞬間にだけ呼ばれる（ポーリングなし） */
+/* ===== 通知のまとめ処理（レスポンス低下対策） =====
+ * 正解を確定すると teams 24行 + history 24行 + state 1行 が一度に書き換わり、
+ * そのぶん通知が連続して飛んできます。1件ごとに読み直すと1回の精算で
+ * 数十回の往復が発生し、処理しきる前に次が来て遅延が積み上がります。
+ * そこで「最初の通知から120ms待ち、その間に来た通知はまとめて1回だけ処理」
+ * する方式にしました。表示の速さは変えずに、往復回数を大幅に減らせます。 */
+const QCOLS = 'q_no,text,layout,choice_a,choice_b,choice_c,choice_d,'
+            + 'media_a,media_b,media_c,media_d,main_media,intro_video,answer_video,'
+            + 'explanation_text,explanation_media,odds_multiplier,revealed_correct';
+const BURST_WAIT_MS = 120;
+let burstTimer = null;
+function scheduleRefresh(){
+  if(burstTimer) return;              // すでに予約済みなら何もしない
+  burstTimer = setTimeout(() => { burstTimer = null; refresh(); }, BURST_WAIT_MS);
+}
+
 db.channel('quiz-screen')
-  .on('postgres_changes', { event:'*', schema:'public', table:'state'     }, refresh)
-  .on('postgres_changes', { event:'*', schema:'public', table:'teams'     }, refresh)
-  .on('postgres_changes', { event:'*', schema:'public', table:'questions' }, refresh)
+  .on('postgres_changes', { event:'*', schema:'public', table:'state'     }, scheduleRefresh)
+  .on('postgres_changes', { event:'*', schema:'public', table:'teams'     }, scheduleRefresh)
+  .on('postgres_changes', { event:'*', schema:'public', table:'questions' }, scheduleRefresh)
   .subscribe((status) => {
     if(status === 'SUBSCRIBED'){ setConnStatus(true); refresh(); }
     else if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT'){
